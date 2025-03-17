@@ -348,14 +348,6 @@ pub struct Flush<'a, P> {
     pipe: &'a mut P,
 }
 
-impl<'a, P: PipeWriter + Unpin> Future for Flush<'a, P> {
-    type Output = FlushResult;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<FlushResult> {
-        Pin::new(&mut *self.pipe).poll_flush(cx)
-    }
-}
-
 pub struct NextBatch<'a, P> {
     pipe: Option<&'a mut P>,
 }
