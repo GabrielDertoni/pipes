@@ -1,7 +1,7 @@
-use std::sync::mpsc;
 use std::hint::black_box;
+use std::sync::mpsc;
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 use pipes::ringbuf::RingBuf;
 
@@ -58,10 +58,12 @@ fn criterion_benchmark(c: &mut Criterion) {
 
     group.throughput(Throughput::Elements((BATCHES * ITEMS_PER_BATCH) as u64));
 
-    group.bench_function("ringbuf", |b| b.iter(|| {
-        batch_dispatch_tx.send(()).unwrap();
-        batch_done_rx.recv().unwrap();
-    }));
+    group.bench_function("ringbuf", |b| {
+        b.iter(|| {
+            batch_dispatch_tx.send(()).unwrap();
+            batch_done_rx.recv().unwrap();
+        })
+    });
 
     drop(batch_dispatch_tx);
     drop(batch_done_rx);
@@ -107,10 +109,12 @@ fn criterion_benchmark(c: &mut Criterion) {
         (batch_dispatch_tx, batch_done_rx, t1, t2)
     };
 
-    group.bench_function("mpsc", |b| b.iter(|| {
-        batch_dispatch_tx.send(()).unwrap();
-        batch_done_rx.recv().unwrap();
-    }));
+    group.bench_function("mpsc", |b| {
+        b.iter(|| {
+            batch_dispatch_tx.send(()).unwrap();
+            batch_done_rx.recv().unwrap();
+        })
+    });
 
     drop(batch_dispatch_tx);
     drop(batch_done_rx);
@@ -155,10 +159,12 @@ fn criterion_benchmark(c: &mut Criterion) {
         (batch_dispatch_tx, batch_done_rx, t1, t2)
     };
 
-    group.bench_function("baseline", |b| b.iter(|| {
-        batch_dispatch_tx.send(()).unwrap();
-        batch_done_rx.recv().unwrap();
-    }));
+    group.bench_function("baseline", |b| {
+        b.iter(|| {
+            batch_dispatch_tx.send(()).unwrap();
+            batch_done_rx.recv().unwrap();
+        })
+    });
 
     drop(batch_dispatch_tx);
     drop(batch_done_rx);

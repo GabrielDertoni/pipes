@@ -1,9 +1,8 @@
 use std::sync::{Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
-use std::any::Any;
 
 pub struct Config {
-    backpressure: usize,
+    pub backpressure: usize,
 }
 
 pub(crate) struct Ctrl<C = Config, S = Mutex<SharedCtrl>> {
@@ -12,6 +11,14 @@ pub(crate) struct Ctrl<C = Config, S = Mutex<SharedCtrl>> {
 }
 
 impl Ctrl {
+    pub(crate) fn new(config: Config) -> Self {
+        Ctrl {
+            config,
+            shared: Mutex::new(SharedCtrl::new()),
+        }
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn config(&self) -> &Config {
         &self.config
     }
@@ -22,17 +29,21 @@ impl Ctrl {
             shared: self.shared.lock().unwrap(),
         }
     }
-
-    pub(crate) fn set_result(&self, result: Result<(), Box<dyn Any + Send>>) {
-        self.lock().set_result(result);
-    }
-
-    pub(crate) fn is_complete(&self) -> bool {
-        self.lock().is_complete()
-    }
 }
 
 impl Ctrl<&Config, MutexGuard<'_, SharedCtrl>> {
+    pub(crate) fn produced(&self) -> usize {
+        self.shared.produced
+    }
+
+    pub(crate) fn consumed(&self) -> usize {
+        self.shared.consumed
+    }
+
+    pub(crate) fn examined(&self) -> usize {
+        self.shared.examined
+    }
+
     pub(crate) fn produce_to(&mut self, produced: usize) {
         self.shared.produce_to(produced);
         self.shared.wake_consumer();
@@ -43,20 +54,18 @@ impl Ctrl<&Config, MutexGuard<'_, SharedCtrl>> {
         self.shared.wake_producer(self.config);
     }
 
-    pub(crate) fn is_complete(&self) -> bool {
-        self.shared.is_complete()
+    pub(crate) fn set_producer_complete(&mut self) {
+        self.shared.set_producer_complete();
     }
 
-    pub(crate) fn set_result(&mut self, result: Result<(), Box<dyn Any + Send>>) {
-        self.shared.set_result(result);
-        self.shared.wake_consumer();
-        self.shared.wake_producer(self.config);
+    pub(crate) fn set_consumer_complete(&mut self) {
+        self.shared.set_consumer_complete();
     }
 
     pub(crate) fn poll_wait_to_produce(&mut self, cx: &mut Context) -> Poll<bool> {
         if self.shared.should_wake_producer(self.config) {
             self.shared.reset_producer_waker();
-            return Poll::Ready(self.shared.is_complete());
+            return Poll::Ready(self.shared.is_consumer_complete());
         }
         self.shared.set_producer_waker(cx.waker().clone());
         Poll::Pending
@@ -65,7 +74,7 @@ impl Ctrl<&Config, MutexGuard<'_, SharedCtrl>> {
     pub(crate) fn poll_wait_to_consume(&mut self, cx: &mut Context) -> Poll<bool> {
         if self.shared.should_wake_consumer() {
             self.shared.reset_consumer_waker();
-            return Poll::Ready(self.shared.is_complete());
+            return Poll::Ready(self.shared.is_producer_complete());
         }
         self.shared.set_consumer_waker(cx.waker().clone());
         Poll::Pending
@@ -80,7 +89,8 @@ pub(crate) struct SharedCtrl {
     // min_ask: usize,
     write_waker: Option<Waker>,
     read_waker: Option<Waker>,
-    result: Option<Result<(), Box<dyn Any + Send>>>,
+    reader_complete: bool,
+    writer_complete: bool,
 }
 
 impl SharedCtrl {
@@ -91,16 +101,18 @@ impl SharedCtrl {
             consumed: 0,
             write_waker: None,
             read_waker: None,
-            result: None,
+            reader_complete: false,
+            writer_complete: false,
         }
     }
 
     fn unexamined(&self) -> usize {
         debug_assert!(self.examined <= self.produced);
-        self.examined - self.produced
+        self.produced - self.examined
     }
 
     fn produce_to(&mut self, produced: usize) {
+        // println!("produced_to: {}", produced);
         debug_assert!(self.produced <= produced);
         self.produced = produced;
     }
@@ -113,7 +125,7 @@ impl SharedCtrl {
     }
 
     fn should_wake_consumer(&self) -> bool {
-        if self.is_complete() {
+        if self.is_producer_complete() {
             return true;
         }
         self.unexamined() > 0
@@ -128,7 +140,7 @@ impl SharedCtrl {
     }
 
     fn should_wake_producer(&self, config: &Config) -> bool {
-        if self.is_complete() {
+        if self.is_consumer_complete() {
             return true;
         }
         self.unexamined() < config.backpressure
@@ -158,15 +170,19 @@ impl SharedCtrl {
         self.read_waker = None;
     }
 
-    fn is_complete(&self) -> bool {
-        self.result.is_some()
+    fn is_producer_complete(&self) -> bool {
+        self.writer_complete
     }
 
-    fn take_result(&mut self) -> Option<Result<(), Box<dyn Any + Send>>> {
-        self.result.take()
+    fn is_consumer_complete(&self) -> bool {
+        self.reader_complete
     }
 
-    fn set_result(&mut self, result: Result<(), Box<dyn Any + Send>>) {
-        self.result = Some(result);
+    fn set_producer_complete(&mut self) {
+        self.writer_complete = true;
+    }
+
+    fn set_consumer_complete(&mut self) {
+        self.reader_complete = true;
     }
 }

@@ -7,6 +7,7 @@ edition = "2024"
 crossbeam-utils = { version = "0.8.21", default-features = false }
 pin-project-lite = "0.2.16"
 slice-dst = "1.6.0"
+tokio = { version = "1.44.1", features = ["macros", "rt-multi-thread", "sync"] }
 
 [dev-dependencies]
 criterion = "0.5.1"

@@ -1,375 +1,704 @@
-#![feature(slice_ptr_get, maybe_uninit_slice)]
+#![feature(maybe_uninit_slice)]
 
-pub mod ringbuf;
 pub mod ctrl;
+mod owning_slice;
+pub mod ringbuf;
+mod utils;
 
 use std::future::Future;
-use std::task::{Poll, Context};
+use std::marker::PhantomData;
 use std::pin::Pin;
+use std::ptr::NonNull;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::{fmt, io};
 
-/// A stage performs some compute work. It reads from the reader side of a pipe
-/// and outputs to a writer side with the data transformed.
-pub trait Stage<R, W>
-where
-    R: PipeReader<Item = Self::Input, Err = Self::Err>,
-    W: PipeWriter<Item = Self::Output, Err = Self::Err>,
-{
-    type Input;
-    type Output;
-    type Err;
+use crate::ctrl::{Config, Ctrl};
+use crate::owning_slice::OwningSlice;
+use crate::utils::SendSafeNonNull;
 
-    type Driver: Driver<Err = Self::Err>;
+pub struct Scheduler {
+    set: tokio::task::JoinSet<io::Result<()>>,
+}
 
-    fn build(self, input: R, output: W) -> Self::Driver;
-
-    fn stage<S, P>(self, next: S, pipe: P) -> Stacked<Self, P, S>
-    where
-        P: Pipe<Item = Self::Output>,
-        /* S: IsStage */
-        Self: Sized,
-    {
-        Stacked {
-            before: self,
-            pipe,
-            after: next,
+impl Scheduler {
+    fn new() -> Self {
+        Scheduler {
+            set: tokio::task::JoinSet::new(),
         }
     }
 
-    fn connect<P>(self, pipeline: P) -> Connected<Self, P>
+    fn spawn<F>(&mut self, f: F)
     where
-        P: Pipeline<Input = Self::Output, Err = Self::Err>,
-        Self: Sized,
+        F: Future<Output = io::Result<()>> + Send + 'static,
     {
-        Connected { stage: self, pipeline }
+        self.set.spawn(f);
+    }
+
+    async fn wait(mut self) -> io::Result<()> {
+        while let Some(join_result) = self.set.join_next().await {
+            let result = match join_result {
+                Ok(result) => result,
+                Err(e) => {
+                    self.set.abort_all();
+                    return Err(io::Error::other(e));
+                }
+            };
+            if let Err(e) = result {
+                self.set.abort_all();
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 }
 
-/// Similar to a `Stage`, but instead of taking reader and writer as parameters
-/// it decides on those types. This is useful for interacting with systems that
-/// don't need intermediate pipes connecting them (e.g. IO). A typical
-/// implementation of a pipeline would be an io_uring ring.
+pub async fn run_pipeline<P>(mut pipeline: P) -> io::Result<()>
+where
+    P: Pipeline<Output = std::convert::Infallible>,
+{
+    let mut scheduler = Scheduler::new();
+    let ctrl = Arc::new(Ctrl::new(Config { backpressure: 0 }));
+    let output = PipeWriter::new(Box::new(EmptyPipeWriter { ctrl }));
+    pipeline.schedule(output, &mut scheduler);
+    scheduler.wait().await
+}
+
+pub fn from_iter<I>(iter: I) -> impl Pipeline<Output = I::Item>
+where
+    I: IntoIterator,
+    I::IntoIter: Send + 'static,
+    I::Item: Send + 'static,
+{
+    struct FromIter<I> {
+        iter: Option<I>,
+    }
+
+    impl<I> Pipeline for FromIter<I>
+    where
+        I: Iterator + Send + 'static,
+        I::Item: Send + 'static,
+    {
+        type Output = I::Item;
+
+        fn schedule(&mut self, mut output: PipeWriter<Self::Output>, scheduler: &mut Scheduler) {
+            let mut iter = self.iter.take().expect("already moved");
+            scheduler.spawn(async move {
+                'outer: loop {
+                    let mut batch = output.batch(None);
+                    while batch.capacity_left() > 0 {
+                        let Some(item) = iter.next() else {
+                            drop(batch);
+                            _ = output.flush().await;
+                            break 'outer;
+                        };
+                        batch.push(item).unwrap();
+                    }
+                    drop(batch);
+                    if output.flush().await {
+                        break;
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+
+    FromIter {
+        iter: Some(iter.into_iter()),
+    }
+}
+
+pub fn mapped<I, O>(mut f: impl FnMut(I) -> O + Send + 'static) -> impl Stage<Input = I, Output = O>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+{
+    try_mapped(move |i| Ok(f(i)))
+}
+
+pub fn try_mapped<I, O>(
+    mut f: impl FnMut(I) -> io::Result<O> + Send + 'static,
+) -> impl Stage<Input = I, Output = O>
+where
+    I: Send + 'static,
+    O: Send + 'static,
+{
+    from_fn(move |mut input, mut output| async move {
+        loop {
+            let in_batch = input.next_batch(None).await?;
+            let done = in_batch.is_done();
+            let mut out_batch = output.batch(in_batch.len());
+            for item in in_batch {
+                out_batch.push(f(item)?).unwrap();
+            }
+            drop(out_batch);
+            if output.flush().await {
+                break;
+            }
+            if done {
+                break;
+            }
+        }
+        Ok(())
+    })
+}
+
+pub fn from_fn<I, O, F, Fut>(f: F) -> impl Stage<Input = I, Output = O>
+where
+    F: FnOnce(PipeReader<I>, PipeWriter<O>) -> Fut,
+    Fut: Future<Output = io::Result<()>> + Send + 'static,
+    O: Send + 'static,
+{
+    struct FromFn<I, O, F, Fut> {
+        f: F,
+        #[allow(clippy::type_complexity)]
+        _marker: PhantomData<(fn(I) -> O, Fut)>,
+    }
+
+    impl<I, O, F, Fut> Stage for FromFn<I, O, F, Fut>
+    where
+        F: FnOnce(PipeReader<I>, PipeWriter<O>) -> Fut,
+        Fut: Future<Output = io::Result<()>> + Send + 'static,
+        O: Send + 'static,
+    {
+        type Input = I;
+        type Output = O;
+        type Fut = Fut;
+
+        fn run(self, input: PipeReader<I>, output: PipeWriter<O>) -> Fut {
+            (self.f)(input, output)
+        }
+    }
+
+    FromFn::<I, O, F, Fut> {
+        f,
+        _marker: PhantomData,
+    }
+}
+
 pub trait Pipeline {
+    type Output: Send + 'static;
+
+    fn schedule(&mut self, output: PipeWriter<Self::Output>, scheduler: &mut Scheduler);
+
+    fn to_dyn(self) -> Box<dyn Pipeline<Output = Self::Output>>
+    where
+        Self: Sized + 'static,
+    {
+        Box::new(self)
+    }
+
+    fn stack<S>(self, stage: S) -> Stacked<Self, S>
+    where
+        S: Stage<Input = Self::Output>,
+        Self: Sized,
+    {
+        Stacked {
+            pipeline: self,
+            stage: Some(stage),
+        }
+    }
+
+    fn for_each<F>(
+        self,
+        mut f: F,
+    ) -> ForEachBatch<
+        Self,
+        impl for<'a> FnMut(ReadBatch<'a, Self::Output>) -> io::Result<()> + Send + 'static,
+    >
+    where
+        F: FnMut(Self::Output) -> io::Result<()> + Send + 'static,
+        Self: Sized,
+    {
+        self.for_each_batch(move |batch| {
+            for item in batch {
+                f(item)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn for_each_batch<F, O>(self, f: F) -> ForEachBatch<Self, F>
+    where
+        F: for<'a> FnMut(ReadBatch<'a, O>) -> io::Result<()> + Send + 'static,
+        Self: Sized,
+    {
+        ForEachBatch {
+            pipeline: self,
+            f: Some(f),
+        }
+    }
+
+    fn collect<'a, O: FromPipeline<Self::Output>>(self) -> O::Fut<'a>
+    where
+        Self: Sized + 'a,
+    {
+        O::from_pipeline(self)
+    }
+}
+
+pub trait FromPipeline<T>: Sized {
+    // NOTE: Maybe it would be better to make `Pipeline: Send + 'static` for everything?
+    type Fut<'a>: Future<Output = io::Result<Self>> + 'a;
+
+    fn from_pipeline<'a, P: Pipeline<Output = T> + 'a>(pipeline: P) -> Self::Fut<'a>;
+}
+
+impl<T: Send + 'static> FromPipeline<T> for Vec<T> {
+    type Fut<'a> = Pin<Box<dyn Future<Output = io::Result<Vec<T>>> + 'a>>;
+
+    fn from_pipeline<'a, P: Pipeline<Output = T> + 'a>(pipeline: P) -> Self::Fut<'a> {
+        async fn async_from_pipeline<P: Pipeline>(pipeline: P) -> io::Result<Vec<P::Output>> {
+            use tokio::sync::oneshot;
+
+            let (tx, rx) = oneshot::channel();
+            let mut vec = Vec::new();
+            run_pipeline(
+                pipeline.stack(from_fn(move |mut reader, _writer| async move {
+                    loop {
+                        let batch = reader.next_batch(None).await?;
+                        let done = batch.is_done();
+                        vec.extend(batch);
+                        if done {
+                            break;
+                        }
+                    }
+                    _ = tx.send(vec);
+                    Ok(())
+                })),
+            )
+            .await?;
+
+            Ok(rx.await.expect("pipeline has not completed entirely"))
+        }
+
+        Box::pin(async_from_pipeline(pipeline))
+    }
+}
+
+impl<O: Send + 'static> Pipeline for Box<dyn Pipeline<Output = O>> {
+    type Output = O;
+
+    fn schedule(&mut self, output: PipeWriter<Self::Output>, scheduler: &mut Scheduler) {
+        self.as_mut().schedule(output, scheduler);
+    }
+}
+
+pub trait Stage {
     type Input;
-    type Output;
-    type Err;
+    type Output: Send + 'static;
+    type Fut: Future<Output = io::Result<()>> + Send + 'static;
 
-    type Writer: PipeWriter<Item = Self::Input, Err = Self::Err>;
-    type Reader: PipeReader<Item = Self::Output, Err = Self::Err>;
-    type Driver: Driver<Err = Self::Err>;
-
-    fn split(self) -> (Self::Writer, Self::Reader, Self::Driver);
+    fn run(self, input: PipeReader<Self::Input>, output: PipeWriter<Self::Output>) -> Self::Fut;
 }
 
-/// A driver is essentially a builder to a future or group of futures. It
-/// encodes the actual computation work that must be done in order to drive a
-/// pipeline.
-pub trait Driver: Send {
-    type Err;
+const DEFAULT_BUF_SIZE: usize = 1024;
+const DEFAULT_BACKPRESSURE: usize = 1024;
 
-    /// Schedules the current driver. This is essentially a visitor pattern
-    /// where `scheduler` is the visitor.
-    fn schedule<S>(self, scheduler: &S)
-    where
-        S: Scheduler<Err = Self::Err>;
+pub fn default_pipe<T: Send + 'static>() -> (PipeReader<T>, PipeWriter<T>) {
+    ringbuf::pipe::<T>(
+        DEFAULT_BUF_SIZE,
+        Config {
+            backpressure: DEFAULT_BACKPRESSURE,
+        },
+    )
 }
 
-/// A scheduler traverses through drivers and decides how to spawn their
-/// futures. The scheduler may decide to schedule either in separate threads or
-/// on the same one or anywhere in between.
-pub trait Scheduler {
-    type Err;
-
-    fn spawn<F>(&self, fut: F)
-    where
-        F: Future<Output = Result<(), Self::Err>> + Send + 'static;
+pub struct PipeReader<T> {
+    inner: Box<dyn PipeReaderImpl<Item = T>>,
 }
 
-/// A pipe is essentially a buffer that has a write end and a read end. Data
-/// that is written to the writer is able to be consumed by the reader in
-/// batches. The pipe structure itself usually won't do much itself but it
-/// rather serves as a way to pack a reader and a writer that are connected in
-/// a single structure. A typical implementation of a pipe would be a ring
-/// buffer or a channel of `Vec<Item>`.
-pub trait Pipe: Send {
-    type Item;
-    type Err;
-    type Writer: PipeWriter<Item = Self::Item, Err = Self::Err>;
-    type Reader: PipeReader<Item = Self::Item, Err = Self::Err>;
+impl<T: Send + 'static> PipeReader<T> {
+    pub(crate) fn new(inner: Box<dyn PipeReaderImpl<Item = T>>) -> Self {
+        PipeReader { inner }
+    }
 
-    fn split(self) -> (Self::Writer, Self::Reader);
+    pub async fn next_batch<'a>(
+        &'a mut self,
+        min_size: impl Into<Option<usize>>,
+    ) -> io::Result<ReadBatch<'a, T>> {
+        let min_size = min_size.into().unwrap_or(1);
+        // NOTE: I don't know how to make this safe.
+        let inner: &'a mut dyn PipeReaderImpl<Item = T> = &mut *self.inner;
+        let mut ptr = unsafe { SendSafeNonNull::new(NonNull::from(&mut *inner)) };
+        let mut inner = Some(inner);
+        Ok(std::future::poll_fn(move |cx| {
+            match inner.take().unwrap().poll_next_batch(min_size, cx) {
+                Poll::Ready(result) => Poll::Ready(result),
+                Poll::Pending => {
+                    inner = Some(unsafe { ptr.as_mut() });
+                    Poll::Pending
+                }
+            }
+        })
+        .await)
+    }
+}
+
+pub struct ReadBatch<'a, T> {
+    slice: OwningSlice<'a, T>,
+    callback: &'a mut dyn ReadBatchCallback,
+    consumed: usize,
+    examined: usize,
+    done: bool,
+}
+
+impl<'a, T> ReadBatch<'a, T> {
+    pub fn new(
+        consumed: usize,
+        examined: usize,
+        done: bool,
+        slice: OwningSlice<'a, T>,
+        callback: &'a mut dyn ReadBatchCallback,
+    ) -> Self {
+        // TODO: properly implement consumed and examined
+        ReadBatch {
+            slice,
+            callback,
+            consumed,
+            examined,
+            done,
+        }
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.done
+    }
+
+    pub fn len(&self) -> usize {
+        self.slice.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Mark elements as consumed and/or examined. Setting `examined` to a
+    /// higher value indicates to the pipeline that more input is required
+    /// before making further process and conuming existing data.
+    pub fn advance_to(&mut self, consumed: usize, examined: usize) {
+        assert!(consumed <= examined);
+        self.consumed = self.consumed.max(consumed);
+        self.examined = self.examined.max(examined);
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.slice.init_slice().iter()
+    }
+}
+
+impl<'a, T> IntoIterator for ReadBatch<'a, T> {
+    type Item = T;
+    type IntoIter = read_batch::IntoIter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        read_batch::IntoIter::new(self)
+    }
+}
+
+impl<T> Drop for ReadBatch<'_, T> {
+    fn drop(&mut self) {
+        self.callback.advance_to(self.consumed, self.examined);
+    }
+}
+
+mod read_batch {
+    use super::ReadBatch;
+
+    pub struct IntoIter<'a, T> {
+        inner: ReadBatch<'a, T>,
+    }
+
+    impl<'a, T> IntoIter<'a, T> {
+        pub(crate) fn new(inner: ReadBatch<'a, T>) -> Self {
+            IntoIter { inner }
+        }
+    }
+
+    impl<'a, T> Iterator for IntoIter<'a, T> {
+        type Item = T;
+
+        fn next(&mut self) -> Option<T> {
+            if let Some(value) = self.inner.slice.pop_front() {
+                self.inner.consumed += 1;
+                self.inner.examined += 1;
+                Some(value)
+            } else {
+                None
+            }
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            (self.len(), Some(self.len()))
+        }
+    }
+
+    impl<'a, T> ExactSizeIterator for IntoIter<'a, T> {
+        fn len(&self) -> usize {
+            self.inner.slice.len()
+        }
+    }
+}
+
+pub trait PipeReaderImpl: Send {
+    type Item: Send + 'static;
+
+    fn poll_next_batch<'a>(
+        &'a mut self,
+        min_size: usize,
+        cx: &mut Context,
+    ) -> Poll<ReadBatch<'a, Self::Item>>;
+}
+
+pub trait ReadBatchCallback: Send {
+    fn advance_to(&mut self, consumed: usize, examined: usize);
+}
+
+pub struct PipeWriter<T> {
+    inner: Box<dyn PipeWriterImpl<Item = T>>,
+}
+
+impl<T: Send + 'static> PipeWriter<T> {
+    pub(crate) fn new(inner: Box<dyn PipeWriterImpl<Item = T>>) -> Self {
+        PipeWriter { inner }
+    }
+
+    pub fn batch<'a>(&'a mut self, min_capacity: impl Into<Option<usize>>) -> WriteBatch<'a, T> {
+        self.inner.batch(min_capacity.into().unwrap_or(1))
+    }
+
+    #[must_use]
+    pub async fn flush(&mut self) -> bool {
+        std::future::poll_fn(|cx| self.inner.poll_flush(cx)).await
+    }
+}
+
+pub struct WriteBatch<'a, T> {
+    slice: OwningSlice<'a, T>,
+    produced: usize,
+    callback: &'a mut dyn WriteBatchCallback,
+}
+
+impl<'a, T> WriteBatch<'a, T> {
+    pub(crate) fn new(
+        produced: usize,
+        slice: OwningSlice<'a, T>,
+        callback: &'a mut dyn WriteBatchCallback,
+    ) -> Self {
+        WriteBatch {
+            produced,
+            slice,
+            callback,
+        }
+    }
+
+    /// Writes an element to the batch. If the batch is already full, returns
+    /// an error instead.
+    pub fn push(&mut self, item: T) -> Result<(), PushErr<T>> {
+        match self.slice.push_back(item) {
+            Ok(()) => {
+                self.produced += 1;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.slice.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The number of elements that still would fit in this batch.
+    pub fn capacity(&self) -> usize {
+        self.slice.capacity()
+    }
+
+    pub fn capacity_left(&self) -> usize {
+        self.capacity() - self.len()
+    }
+}
+
+impl<T> Drop for WriteBatch<'_, T> {
+    fn drop(&mut self) {
+        self.callback.produce_to(self.produced);
+    }
 }
 
 /// The writer side of the pipe. This also makes it possible to control pipeline
 /// flow (like knowing when to stop or if the pipeline erroed).
-pub trait PipeWriter: Send {
-    type Item;
-    type Err;
-    type Batch<'a>: WriteBatch<Item = Self::Item> + 'a
-    where
-        Self: 'a;
+pub trait PipeWriterImpl: Send {
+    type Item: Send + 'static;
 
     /// Gets the next batch to write to. After writing data to the current
     /// batch, `flush` should be called in order to send the batch to the
     /// consuming side of the pipe. This function is allowed to return an empty
     /// batch if called repeatedly without flushing.
-    fn batch<'a>(&'a mut self) -> Self::Batch<'a>;
+    fn batch<'a>(&'a mut self, min_capacity: usize) -> WriteBatch<'a, Self::Item>;
 
     /// Flushes data to the consuming side of the pipe. Returns an error in case
     /// the pipeline failed or a signal indicating it has completed successfuly.
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<FlushResult>;
+    fn poll_flush(&mut self, cx: &mut Context) -> Poll<bool>;
+}
 
-    /// Mark this producer as complete, signaling that no more data will be
-    /// sent. This method should be preferred rather than dropping the writer.
-    fn complete(self);
+pub trait WriteBatchCallback: Send {
+    fn produce_to(&mut self, produced: usize);
+}
 
-    fn fail(self, err: Self::Err);
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PushErr<T>(pub T);
 
-    async fn enter<F>(mut self, f: F)
-    where
-        F: AsyncFnOnce(&mut Self) -> Result<(), Self::Err>,
-        Self: Sized,
-    {
-        match f(&mut self).await {
-            Ok(()) => self.complete(),
-            Err(err) => self.fail(err),
+impl<T> fmt::Debug for PushErr<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PushErr").finish_non_exhaustive()
+    }
+}
+
+pub struct EmptyPipeWriter {
+    ctrl: Arc<Ctrl>,
+}
+
+impl PipeWriterImpl for EmptyPipeWriter {
+    type Item = std::convert::Infallible;
+
+    fn batch<'a>(&'a mut self, _min_capacity: usize) -> WriteBatch<'a, Self::Item> {
+        let produced;
+        {
+            let ctrl = self.ctrl.lock();
+            produced = ctrl.produced();
         }
+        WriteBatch::new(produced, OwningSlice::empty(), &mut self.ctrl)
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context) -> Poll<bool> {
+        self.ctrl.lock().poll_wait_to_produce(cx)
     }
 }
 
-pub trait PipWriterExt: PipeWriter + Sized {
-    fn flush(&mut self) -> Flush<'_, Self>
-    where
-        Self: Unpin,
-    {
-        assert_future_with_output::<_, FlushResult>(Flush { pipe: self })
-    }
-}
-
-impl<T: PipeWriter> PipWriterExt for T {}
-
-/// The reader side of the pipe. This also makes it possible to control pipeline
-/// flow (like knowing when to stop or if the pipeline erroed).
-pub trait PipeReader: Send {
-    type Item;
-    type Err;
-    type Batch<'a>: ReadBatch<Item = Self::Item> + 'a
-    where
-        Self: 'a;
-
-    fn poll_next_batch<'a>(self: Pin<&'a mut Self>, cx: &mut Context) -> Poll<Self::Batch<'a>>;
-
-    /// The function to call when a `Ok(None)` is received from `next_batch`.
-    /// This indicates that the consumer is done consuming.
-    fn complete(self);
-
-    fn fail(self, err: Self::Err);
-}
-
-pub trait PipeReaderExt: PipeReader + Sized {
-    fn next_batch<'a>(&'a mut self) -> NextBatch<'a, Self>
-    where
-        Self: Unpin,
-    {
-        assert_future_with_output::<_, Self::Batch<'a>>(NextBatch { pipe: Some(self) })
-    }
-
-    async fn enter<F>(mut self, f: F)
-    where
-        F: AsyncFnOnce(&mut Self) -> Result<(), Self::Err>,
-        Self: Sized,
-    {
-        match f(&mut self).await {
-            Ok(()) => self.complete(),
-            Err(err) => self.fail(err),
-        }
-    }
-}
-
-impl<T: PipeReader> PipeReaderExt for T {}
-
-/// A batch of data coming from a `PipeReader`. The positions and indicies used
-/// by the batch reflect global positions throught the lifetime of the pipeline
-/// rather than being interior to this batch. This allows for more easily
-/// implementing logic that may cross batch boundaries.
-pub trait ReadBatch {
-    type Item;
-
-    /// The position of the next item relative to the entire pipeline.
-    fn pos(&self) -> usize;
-
-    /// Return the element at `pos()` and advance the position.
-    fn next(&mut self) -> Option<Self::Item>;
-
-    /// Mark elements as consumed and/or examined. Setting `examined` to a
-    /// higher value indicates to the pipeline that more input is required
-    /// before making further process and conuming existing data.
-    fn advance_to(&mut self, consumed: usize, examined: usize);
-
-    fn get(&self, index: usize) -> Option<&Self::Item>;
-    fn get_mut(&mut self, index: usize) -> Option<&mut Self::Item>;
-
-    /// The number of unconsumed elements in the current batch.
-    fn len(&self) -> usize;
-
-    fn is_complete(&self) -> bool;
-
-    fn cur_slice(&self) -> &[Self::Item] {
-        if let Some(el) = self.get(0) {
-            std::slice::from_ref(el)
-        } else {
-            &[]
-        }
-    }
-}
-
-pub trait WriteBatch {
-    type Item;
-
-    /// Writes an element to the batch. If the batch is already full, returns
-    /// an error instead.
-    fn push(&mut self, item: Self::Item) -> Result<(), PushErr<Self::Item>>;
-
-    /// The number of elements that still would fit in this batch.
-    fn capacity(&self) -> usize;
-
-    fn push_slice(&mut self, items: &[Self::Item]) -> Result<(), PushErr<&[Self::Item]>>
-    where
-        Self::Item: Copy,
-    {
-        let mut items = items;
-    }
-}
-
-pub enum FlushResult {
-    Yield,
-    Completed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PushErr<T>(T);
-
-pub type ErasedDriverFut<E> = DriverFut<Pin<Box<dyn Future<Output = Result<(), E>> + Send + 'static>>>;
-
-pub fn erased_drive_fut<F, E>(fut: F) -> ErasedDriverFut<E>
-where
-    F: Future<Output = Result<(), E>> + Send + 'static,
-{
-    DriverFut { fut: Box::pin(fut) }
-}
-
-pub fn drive_fut<F, E>(fut: F) -> DriverFut<F>
-where
-    F: Future<Output = Result<(), E>> + Send + 'static,
-{
-    DriverFut { fut }
-}
-
-pub struct DriverFut<F> {
-    fut: F,
-}
-
-impl<F, E> Driver for DriverFut<F>
-where
-    F: Future<Output = Result<(), E>> + Send + 'static,
-{
-    type Err = E;
-
-    /// Schedules the current driver. This is essentially a visitor pattern
-    /// where `scheduler` is the visitor.
-    fn schedule<S>(self, scheduler: &S)
-    where
-        S: Scheduler<Err = Self::Err>,
-    {
-        scheduler.spawn(async move { self.fut.await })
-    }
-}
-
-pub struct Stacked<S1, P, S2> {
-    before: S1,
-    pipe: P,
-    after: S2,
-}
-
-impl<R, W, S1, P, S2, E, I, O> Stage<R, W> for Stacked<S1, P, S2>
-where
-    R: PipeReader<Item = I, Err = E>,
-    W: PipeWriter<Item = O, Err = E>,
-    P: Pipe<Err = E>,
-    S1: Stage<R, P::Writer, Input = I, Output = P::Item, Err = E>,
-    S2: Stage<P::Reader, W, Input = P::Item, Output = O, Err = E>,
-{
-    type Input = I;
-    type Output = O;
-    type Err = E;
-
-    type Driver = Join<S1::Driver, S2::Driver>;
-
-    fn build(self, reader: R, writer: W) -> Self::Driver {
-        let (pipe_writer, pipe_reader) = self.pipe.split();
-        let before = self.before.build(reader, pipe_writer);
-        let after = self.after.build(pipe_reader, writer);
-        Join::new(before, after)
-    }
-}
-
-pub struct Connected<S, P> {
-    stage: S,
+pub struct Stacked<P, S> {
     pipeline: P,
+    stage: Option<S>,
 }
 
-pub struct Join<D1, D2> {
-    d1: D1,
-    d2: D2,
-}
-
-impl<D1, D2> Join<D1, D2> {
-    pub fn new(d1: D1, d2: D2) -> Self {
-        Join { d1, d2 }
-    }
-}
-
-impl<D1, D2, E> Driver for Join<D1, D2>
+impl<P, S, M> Pipeline for Stacked<P, S>
 where
-    D1: Driver<Err = E>,
-    D2: Driver<Err = E>,
+    P: Pipeline<Output = M>,
+    S: Stage<Input = M>,
+    M: Send + 'static,
 {
-    type Err = E;
+    type Output = S::Output;
 
-    fn schedule<S>(self, scheduler: &S)
-    where
-        S: Scheduler<Err = Self::Err>,
-    {
-        self.d1.schedule(scheduler);
-        self.d2.schedule(scheduler);
+    fn schedule(&mut self, output: PipeWriter<S::Output>, scheduler: &mut Scheduler) {
+        let Self { pipeline, stage } = self;
+        let stage = stage.take().expect("already scheduled");
+
+        let (intermediate_in, intermediate_out) = default_pipe::<M>();
+        pipeline.schedule(intermediate_out, scheduler);
+        scheduler.spawn(stage.run(intermediate_in, output));
     }
 }
 
-pub struct Flush<'a, P> {
-    pipe: &'a mut P,
+pub struct ForEachBatch<P, F> {
+    pipeline: P,
+    f: Option<F>,
 }
 
-pub struct NextBatch<'a, P> {
-    pipe: Option<&'a mut P>,
-}
+impl<P, F> Pipeline for ForEachBatch<P, F>
+where
+    P: Pipeline,
+    F: for<'a> FnMut(ReadBatch<'a, P::Output>) -> io::Result<()> + Send + 'static,
+{
+    type Output = std::convert::Infallible;
 
-impl<'a, P: PipeReader + Unpin> Future for NextBatch<'a, P> {
-    type Output = P::Batch<'a>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<P::Batch<'a>> {
-        use std::ptr::NonNull;
-
-        let p: &'a mut P = &mut *self.pipe.take().expect("polled after completion");
-        let mut ptr = NonNull::from(&mut *p);
-        if let Poll::Ready(res) = Pin::new(p).poll_next_batch(cx) {
-            return Poll::Ready(res);
-        }
-        // SAFETY: Since `poll_next_batch` returned `Pending`, we know the ref
-        // is still valid.
-        // NOTE: It's a bit unfortunate that I didn't find another way of doing
-        // this that doesn't require unsafe.
-        self.pipe = Some(unsafe { ptr.as_mut() });
-        Poll::Pending
+    fn schedule(&mut self, _output: PipeWriter<Self::Output>, scheduler: &mut Scheduler) {
+        let Self { pipeline, f } = self;
+        let mut f = f.take().expect("already scheduled");
+        let (mut intermediate_in, intermediate_out) = default_pipe::<P::Output>();
+        pipeline.schedule(intermediate_out, scheduler);
+        scheduler.spawn(async move {
+            loop {
+                let batch = intermediate_in.next_batch(None).await?;
+                let done = batch.is_done();
+                f(batch)?;
+                if done {
+                    break;
+                }
+            }
+            Ok(())
+        });
     }
 }
 
-fn assert_future_with_output<F: Future<Output = O>, O>(f: F) -> F { f }
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[tokio::test]
+    async fn can_collect_from_iter() {
+        let output = from_iter([1, 2, 3])
+            .collect::<'_, Vec<i32>>()
+            .await
+            .unwrap();
+
+        assert_eq!(output, &[1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn mapped_stages_work() {
+        let output = from_iter([1, 2, 3])
+            .stack(mapped(|i| i * 2))
+            .collect::<'_, Vec<i32>>()
+            .await
+            .unwrap();
+
+        assert_eq!(output, &[2, 4, 6]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn can_execute_in_multiple_threads() {
+        use std::sync::{Arc, Barrier};
+
+        let barrier = Arc::new(Barrier::new(2));
+        run_pipeline(
+            from_iter([1, 2, 3])
+                .stack(from_fn({
+                    let barrier = Arc::clone(&barrier);
+                    |mut input, mut output| async move {
+                        barrier.wait();
+                        loop {
+                            let batch = input.next_batch(None).await?;
+                            let done = batch.is_done();
+                            let mut out = output.batch(batch.len());
+                            for item in batch {
+                                _ = out.push(item);
+                            }
+                            drop(out);
+                            if output.flush().await {
+                                break;
+                            }
+                            if done {
+                                break;
+                            }
+                        }
+                        Ok(())
+                    }
+                }))
+                .stack(from_fn(|mut input, _output| async move {
+                    barrier.wait();
+                    loop {
+                        let batch = input.next_batch(None).await?;
+                        if batch.is_done() {
+                            break;
+                        }
+                    }
+                    Ok(())
+                })),
+        )
+        .await
+        .unwrap();
+    }
+}

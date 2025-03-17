@@ -1,203 +1,129 @@
+use std::mem::MaybeUninit;
 use std::ops::Range;
 use std::ptr::NonNull;
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
 };
-use std::mem::MaybeUninit;
 use std::task::{Context, Poll, ready};
-use std::pin::Pin;
-use std::marker::PhantomData;
-use std::any::Any;
 
 use crossbeam_utils::CachePadded;
 use slice_dst::SliceWithHeader;
 
-use crate::{FlushResult, PushErr, ctrl::Ctrl};
+use crate::ctrl::Config;
+use crate::owning_slice::OwningSlice;
+use crate::{
+    PipeReader, PipeReaderImpl, PipeWriter, PipeWriterImpl, ReadBatch, ReadBatchCallback,
+    WriteBatch, WriteBatchCallback,
+};
+use crate::{PushErr, ctrl::Ctrl};
 
-
-pub struct Pipe<T, E> {
-    ctrl: Arc<Ctrl>,
-    buf: RingBuf<T>,
-    _marker: PhantomData<E>,
+pub fn pipe<T: Send + 'static>(buf_size: usize, config: Config) -> (PipeReader<T>, PipeWriter<T>) {
+    assert!(buf_size < u32::MAX as usize);
+    let buf = RingBuf::new(buf_size as u32);
+    let ctrl = Arc::new(Ctrl::new(config));
+    let (writer, reader) = buf.split();
+    (
+        PipeReader::new(Box::new(RingPipeReader {
+            ctrl: Arc::clone(&ctrl),
+            buf: reader,
+            synced: 0,
+        })),
+        PipeWriter::new(Box::new(RingPipeWriter {
+            ctrl,
+            buf: writer,
+            flushed: 0,
+        })),
+    )
 }
 
-impl<T: Send, E: Any + Send> crate::Pipe for Pipe<T, E> {
-    type Item = T;
-    type Err = E;
-    type Writer = PipeWriter<T, E>;
-    type Reader = PipeReader<T, E>;
-
-    fn split(self) -> (Self::Writer, Self::Reader) {
-        let (writer, reader) = self.buf.split();
-        (
-            PipeWriter {
-                ctrl: Arc::clone(&self.ctrl),
-                buf: writer,
-                produced: 0,
-                _marker: PhantomData,
-            },
-            PipeReader {
-                ctrl: self.ctrl,
-                buf: reader,
-                pos: 0,
-                examined: 0,
-                _marker: PhantomData,
-            }
-        )
-    }
-}
-
-pub struct PipeWriter<T, E> {
+pub struct RingPipeWriter<T> {
     ctrl: Arc<Ctrl>,
     buf: Writer<T>,
-    produced: usize,
-    _marker: PhantomData<E>,
+    flushed: usize,
 }
 
-impl<T: Send, E: Any + Send> crate::PipeWriter for PipeWriter<T, E> {
+impl<T: Send + 'static> PipeWriterImpl for RingPipeWriter<T> {
     type Item = T;
-    type Err = E;
-    type Batch<'a> = WriteBatch<'a, T, E>
-    where
-        Self: 'a;
 
-    fn batch<'a>(&'a mut self) -> Self::Batch<'a> {
-        WriteBatch { writer: self }
+    fn batch<'a>(&'a mut self, min_capacity: usize) -> WriteBatch<'a, Self::Item> {
+        // TODO: use min_capacity
+        let slice = self.buf.writable_slice();
+        assert!(min_capacity <= slice.unfilled());
+        let produced = self.ctrl.lock().produced();
+        WriteBatch::new(produced, slice, &mut self.ctrl)
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<FlushResult> {
-        self.buf.sync();
+    fn poll_flush(&mut self, cx: &mut Context) -> Poll<bool> {
         let mut ctrl = self.ctrl.lock();
-        ctrl.produce_to(self.produced);
-        Poll::Ready(match ready!(ctrl.poll_wait_to_produce(cx)) {
-            false => FlushResult::Yield,
-            true => FlushResult::Completed,
-        })
-    }
-
-    fn complete(self) {
-        self.ctrl.set_result(Ok(()));
-    }
-
-    fn fail(self, err: E) {
-        self.ctrl.set_result(Err(Box::new(err)));
+        unsafe { self.buf.advance((ctrl.produced() - self.flushed) as u32) }
+        self.flushed = ctrl.produced();
+        self.buf.sync();
+        ctrl.poll_wait_to_produce(cx)
     }
 }
 
-impl<T, E> Unpin for PipeWriter<T, E> {}
-
-pub struct WriteBatch<'a, T, E> {
-    writer: &'a mut PipeWriter<T, E>,
-}
-
-impl<'a, T, E> crate::WriteBatch for WriteBatch<'a, T, E> {
-    type Item = T;
-
-    fn push(&mut self, item: Self::Item) -> Result<(), PushErr<Self::Item>> {
-        self.writer.produced += 1;
-        self.writer.buf.push(item)
-    }
-
-    fn capacity(&self) -> usize {
-        self.writer.buf.remaining() as usize
+impl<T> Drop for RingPipeWriter<T> {
+    fn drop(&mut self) {
+        self.ctrl.lock().set_producer_complete();
     }
 }
 
-pub struct PipeReader<T, E> {
+impl WriteBatchCallback for Arc<Ctrl> {
+    fn produce_to(&mut self, produced: usize) {
+        // println!("produce_to: {produced}");
+        self.lock().produce_to(produced);
+    }
+}
+
+pub struct RingPipeReader<T> {
     ctrl: Arc<Ctrl>,
     buf: Reader<T>,
-    pos: usize,
-    examined: usize,
-    _marker: PhantomData<E>,
+    synced: usize,
 }
 
-impl<T: Send, E: Any + Send> crate::PipeReader for PipeReader<T, E> {
+impl<T: Send + 'static> PipeReaderImpl for RingPipeReader<T> {
     type Item = T;
-    type Err = E;
-    type Batch<'a> = ReadBatch<'a, T, E>
-    where
-        Self: 'a;
 
-    fn poll_next_batch<'a>(mut self: Pin<&'a mut Self>, cx: &mut Context) -> Poll<Self::Batch<'a>> {
-        self.buf.sync();
+    fn poll_next_batch<'a>(
+        &'a mut self,
+        // TODO: use min_size
+        _min_size: usize,
+        cx: &mut Context,
+    ) -> Poll<ReadBatch<'a, T>> {
+        let consumed;
+        let examined;
+        let done;
         {
             let mut ctrl = self.ctrl.lock();
-            ctrl.advance_to(self.pos, self.examined);
-            let _done = ready!(ctrl.poll_wait_to_consume(cx));
+            consumed = ctrl.consumed();
+            examined = ctrl.examined();
+            done = ready!(ctrl.poll_wait_to_consume(cx));
         }
-        Poll::Ready(ReadBatch { reader: self.get_mut() })
-    }
-
-    fn complete(self) {
-        self.ctrl.set_result(Ok(()));
-    }
-
-    fn fail(self, err: E) {
-        self.ctrl.set_result(Err(Box::new(err)));
-    }
-}
-
-impl<T, E> Unpin for PipeReader<T, E> {}
-
-pub struct ReadBatch<'a, T, E> {
-    reader: &'a mut PipeReader<T, E>,
-}
-
-impl<'a, T, E> ReadBatch<'a, T, E> {
-    fn local_index(&self, index: usize) -> u32 {
-        (self.reader.pos - index) as u32
+        unsafe {
+            self.buf.advance((consumed - self.synced) as u32);
+        }
+        self.buf.sync();
+        Poll::Ready(ReadBatch::new(
+            consumed,
+            examined,
+            done,
+            self.buf.readable_slice(),
+            &mut self.ctrl,
+        ))
     }
 }
 
-impl<'a, T, E> crate::ReadBatch for ReadBatch<'a, T, E> {
-    type Item = T;
-
-    fn pos(&self) -> usize {
-        self.reader.pos
+impl<T> Drop for RingPipeReader<T> {
+    fn drop(&mut self) {
+        self.ctrl.lock().set_consumer_complete();
     }
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
-        self.reader.pos += 1;
-        self.reader.buf.pop()
-    }
-
+impl ReadBatchCallback for Arc<Ctrl> {
     fn advance_to(&mut self, consumed: usize, examined: usize) {
-        while self.pos() < consumed {
-            drop(self.next());
-        }
-        self.reader.examined = self.reader.examined.max(examined);
-    }
-
-    fn get(&self, index: usize) -> Option<&Self::Item> {
-        if index < self.pos() {
-            return None;
-        }
-        self.reader.buf.get(self.local_index(index))
-    }
-
-    fn get_mut(&mut self, index: usize) -> Option<&mut Self::Item> {
-        if index < self.pos() {
-            return None;
-        }
-        self.reader.buf.get_mut(self.local_index(index))
-    }
-
-    fn len(&self) -> usize {
-        self.reader.buf.len() as usize
-    }
-
-    fn is_complete(&self) -> bool {
-        self.reader.ctrl.is_complete()
-    }
-
-    fn cur_slice(&self) -> &[Self::Item] {
-        let (first, last) = self.reader.buf.slices();
-        if first.len() > 0 {
-            first
-        } else {
-            last
-        }
+        // println!("consumed: {consumed}, examined: {examined}");
+        self.lock().advance_to(consumed, examined);
     }
 }
 
@@ -212,16 +138,27 @@ impl<T> RingBuf<T> {
         // If capacity is allowed to be u32::MAX, there would be a situation
         // where, with a full buffer, it wouldn't be possible to tell whether
         // the buffer is filled or empty.
-        assert!(capacity < std::u32::MAX, "capacity must be smaller than u32::MAX");
-        RingBuf { inner: unsafe { Inner::new_unchecked(capacity) } }
+        assert!(
+            capacity < u32::MAX,
+            "capacity must be smaller than u32::MAX"
+        );
+        RingBuf {
+            inner: unsafe { Inner::new_unchecked(capacity) },
+        }
     }
 
     pub fn split(mut self) -> (Writer<T>, Reader<T>) {
         let inner = Arc::get_mut(&mut self.inner).unwrap();
         let header = LocalHeader::load_exclusive(&mut inner.0.header);
         (
-            Writer { header: header.clone(), inner: Arc::clone(&self.inner) },
-            Reader { header, inner: self.inner },
+            Writer {
+                header,
+                inner: Arc::clone(&self.inner),
+            },
+            Reader {
+                header,
+                inner: self.inner,
+            },
         )
     }
 }
@@ -242,11 +179,35 @@ impl<T> Writer<T> {
         Ok(())
     }
 
+    /// # Safety
+    /// The caller must ensure there is enough capacity left for the item to be pushed. That is, `remaining() > 0`.
     pub unsafe fn push_unchecked(&mut self, item: T) {
         unsafe {
-            self.inner.slice_ptr().add(self.header.tail() as usize).write(item);
+            self.inner
+                .slice_ptr()
+                .add(self.header.tail() as usize)
+                .write(item);
         }
-        self.header.tail += 1;
+        self.header.tail = self.header.tail.wrapping_add(1);
+    }
+
+    pub fn writable_slice<'a>(&'a mut self) -> OwningSlice<'a, T> {
+        let head = self.header.head() as usize;
+        let tail = self.header.tail() as usize;
+        let ptr = unsafe { self.inner.uninit_slice_ptr().add(tail) };
+        let mut slice_ptr = if tail >= head && self.header.unfilled() > 0 {
+            NonNull::slice_from_raw_parts(ptr, self.header.capacity() as usize - tail)
+        } else {
+            NonNull::slice_from_raw_parts(ptr, head - tail)
+        };
+        OwningSlice::new_unfilled(unsafe { slice_ptr.as_mut() })
+    }
+
+    /// # Safety
+    /// The caller must ensure `n <= self.remaining()` and that the next `n` items were initialized in the buffer sequence.
+    pub unsafe fn advance(&mut self, n: u32) {
+        assert!(n <= self.remaining());
+        self.header.tail = self.header.tail.wrapping_add(n);
     }
 
     pub fn sync(&mut self) {
@@ -259,8 +220,12 @@ impl<T> Writer<T> {
         self.header.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn remaining(&self) -> u32 {
-        self.header.remaining()
+        self.header.unfilled()
     }
 }
 
@@ -278,17 +243,43 @@ pub struct Reader<T> {
 }
 
 impl<T> Reader<T> {
+    pub fn readable_slice<'a>(&'a mut self) -> OwningSlice<'a, T> {
+        let head = self.header.head() as usize;
+        let tail = self.header.tail() as usize;
+        let ptr = unsafe { self.inner.uninit_slice_ptr().add(head) };
+        let mut slice_ptr = if head >= tail && self.header.len() > 0 {
+            NonNull::slice_from_raw_parts(ptr, self.header.capacity() as usize - head)
+        } else {
+            NonNull::slice_from_raw_parts(ptr, tail - head)
+        };
+        OwningSlice::new_filled(unsafe { slice_ptr.as_mut().assume_init_mut() })
+    }
+
     pub fn pop(&mut self) -> Option<T> {
-        if self.len() == 0 {
-            return None
+        if self.is_empty() {
+            return None;
         }
         Some(unsafe { self.pop_unchecked() })
     }
 
+    /// # Safety
+    /// The caller must ensure `self.len() > 0`.
     pub unsafe fn pop_unchecked(&mut self) -> T {
-        let value = unsafe { self.inner.slice_ptr().add(self.header.head() as usize).read() };
-        self.header.head += 1;
+        let value = unsafe {
+            self.inner
+                .slice_ptr()
+                .add(self.header.head() as usize)
+                .read()
+        };
+        self.header.head = self.header.head.wrapping_add(1);
         value
+    }
+
+    /// # Safety
+    /// The caller must ensure that `n` elements have been consumed from the raw buffer.
+    pub unsafe fn advance(&mut self, n: u32) {
+        assert!(n <= self.len());
+        self.header.head = self.header.head.wrapping_add(n);
     }
 
     pub fn skip(&mut self, n: u32) {
@@ -305,9 +296,12 @@ impl<T> Reader<T> {
         }
     }
 
+    /// # Safety
+    /// The caller must ensure `i < self.len()`.
     pub unsafe fn get_unchecked(&self, i: u32) -> &T {
         unsafe {
-            self.inner.slice_ptr()
+            self.inner
+                .slice_ptr()
                 .add(self.header.head_offset(i))
                 .as_ref()
         }
@@ -321,9 +315,12 @@ impl<T> Reader<T> {
         }
     }
 
-    pub unsafe fn get_unchecked_mut(&self, i: u32) -> &mut T {
+    /// # Safety
+    /// The caller must ensure `i < self.len()`.
+    pub unsafe fn get_unchecked_mut(&mut self, i: u32) -> &mut T {
         unsafe {
-            self.inner.slice_ptr()
+            self.inner
+                .slice_ptr()
                 .add(self.header.head_offset(i))
                 .as_mut()
         }
@@ -341,6 +338,10 @@ impl<T> Reader<T> {
 
     pub fn len(&self) -> u32 {
         self.header.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -365,6 +366,10 @@ impl<T> Inner<T> {
         unsafe { NonNull::new_unchecked(self.0.slice.as_ptr() as *mut T) }
     }
 
+    fn uninit_slice_ptr(&self) -> NonNull<MaybeUninit<T>> {
+        self.slice_ptr().cast()
+    }
+
     unsafe fn new_unchecked(capacity: u32) -> Arc<Self> {
         type Slice<T> = SliceWithHeader<Header, MaybeUninit<T>>;
 
@@ -376,7 +381,7 @@ impl<T> Inner<T> {
                 tail: CachePadded::new(AtomicU32::new(0)),
                 mask: capacity - 1,
             },
-            std::iter::repeat_with(MaybeUninit::uninit).take(capacity as usize)
+            std::iter::repeat_with(MaybeUninit::uninit).take(capacity as usize),
         );
         // SAFETY: Inner is `repr(transparent)`
         unsafe { std::mem::transmute::<Arc<Slice<T>>, Arc<Inner<T>>>(arc) }
@@ -425,7 +430,7 @@ impl LocalHeader {
         self.tail.wrapping_sub(self.head)
     }
 
-    fn remaining(&self) -> u32 {
+    fn unfilled(&self) -> u32 {
         self.capacity() - self.len()
     }
 
@@ -447,9 +452,15 @@ impl LocalHeader {
 
     fn ranges(&self) -> (Range<usize>, Range<usize>) {
         if self.head() + self.len() <= self.capacity() {
-            (self.head() as usize..(self.head() + self.len()) as usize, self.capacity() as usize..self.capacity() as usize)
+            (
+                self.head() as usize..(self.head() + self.len()) as usize,
+                self.capacity() as usize..self.capacity() as usize,
+            )
         } else {
-            (0..self.tail() as usize, self.head() as usize..self.capacity() as usize)
+            (
+                0..self.tail() as usize,
+                self.head() as usize..self.capacity() as usize,
+            )
         }
     }
 
@@ -462,29 +473,25 @@ impl LocalHeader {
         let (start_buf, buf) = buf.split_at(start.end - start.start);
         let (_, buf) = buf.split_at(end.start - start.end);
         let (end_buf, _) = buf.split_at(end.end - end.start);
-        unsafe {
-            (
-                MaybeUninit::slice_assume_init_ref(end_buf),
-                MaybeUninit::slice_assume_init_ref(start_buf),
-            )
-        }
+        unsafe { (end_buf.assume_init_ref(), start_buf.assume_init_ref()) }
     }
 
-    unsafe fn slices_mut<'a, T>(&self, buf: &'a mut [MaybeUninit<T>]) -> (&'a mut [T], &'a mut [T]) {
+    unsafe fn slices_mut<'a, T>(
+        &self,
+        buf: &'a mut [MaybeUninit<T>],
+    ) -> (&'a mut [T], &'a mut [T]) {
         let (start, end) = self.ranges();
-        assert!(start.start <= start.end && start.end <= end.start && end.start <= end.end, "start: {start:?}, end: {end:?}");
+        assert!(
+            start.start <= start.end && start.end <= end.start && end.start <= end.end,
+            "start: {start:?}, end: {end:?}"
+        );
 
         // TODO: Improve this
         let (_, buf) = buf.split_at_mut(start.start);
         let (start_buf, buf) = buf.split_at_mut(start.end - start.start);
         let (_, buf) = buf.split_at_mut(end.start - start.end);
         let (end_buf, _) = buf.split_at_mut(end.end - end.start);
-        unsafe {
-            (
-                MaybeUninit::slice_assume_init_mut(end_buf),
-                MaybeUninit::slice_assume_init_mut(start_buf),
-            )
-        }
+        unsafe { (end_buf.assume_init_mut(), start_buf.assume_init_mut()) }
     }
 }
 
@@ -552,7 +559,10 @@ mod test {
 
         let (first, last) = reader.slices();
         assert_eq!(first.len() + last.len(), reader.len() as usize);
-        assert_eq!((first, last), (&[] as &[i32], &[0, 1, 2, 3, 4, 5, 6, 7] as &[i32]));
+        assert_eq!(
+            (first, last),
+            (&[] as &[i32], &[0, 1, 2, 3, 4, 5, 6, 7] as &[i32])
+        );
 
         reader.skip(5);
         assert_eq!(reader.len(), 3);
@@ -567,7 +577,10 @@ mod test {
 
         let (first, last) = reader.slices();
         assert_eq!(first.len() + last.len(), reader.len() as usize);
-        assert_eq!((first, last), (&[5, 6, 7] as &[i32], &[8, 9, 10, 11] as &[i32]));
+        assert_eq!(
+            (first, last),
+            (&[5, 6, 7] as &[i32], &[8, 9, 10, 11] as &[i32])
+        );
     }
 
     #[test]
