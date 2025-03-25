@@ -2,8 +2,10 @@
 
 pub mod config;
 pub mod ctrl;
-mod owning_slice;
 pub mod ringbuf;
+
+mod io;
+mod owning_slice;
 mod utils;
 
 use std::future::Future;
@@ -11,7 +13,8 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::{fmt, io};
+use std::fmt;
+pub use std::io::{Error as IoError, Result as IoResult};
 
 pub use crate::config::Config;
 
@@ -20,7 +23,7 @@ use crate::owning_slice::OwningSlice;
 use crate::utils::SendSafeNonNull;
 
 pub struct Scheduler {
-    set: tokio::task::JoinSet<io::Result<()>>,
+    set: tokio::task::JoinSet<IoResult<()>>,
 }
 
 impl Scheduler {
@@ -32,18 +35,18 @@ impl Scheduler {
 
     fn spawn<F>(&mut self, f: F)
     where
-        F: Future<Output = io::Result<()>> + Send + 'static,
+        F: Future<Output = IoResult<()>> + Send + 'static,
     {
         self.set.spawn(f);
     }
 
-    async fn wait(mut self) -> io::Result<()> {
+    async fn wait(mut self) -> IoResult<()> {
         while let Some(join_result) = self.set.join_next().await {
             let result = match join_result {
                 Ok(result) => result,
                 Err(e) => {
                     self.set.abort_all();
-                    return Err(io::Error::other(e));
+                    return Err(IoError::other(e));
                 }
             };
             if let Err(e) = result {
@@ -55,7 +58,7 @@ impl Scheduler {
     }
 }
 
-pub async fn run_pipeline<P>(mut pipeline: P) -> io::Result<()>
+pub async fn run_pipeline<P>(mut pipeline: P) -> IoResult<()>
 where
     P: Pipeline<Output = std::convert::Infallible>,
 {
@@ -120,7 +123,7 @@ where
 }
 
 pub fn try_mapped<I, O>(
-    mut f: impl FnMut(I) -> io::Result<O> + Send + 'static,
+    mut f: impl FnMut(I) -> IoResult<O> + Send + 'static,
 ) -> impl Stage<Input = I, Output = O>
 where
     I: Send + 'static,
@@ -135,10 +138,7 @@ where
                 out_batch.push(f(item)?).unwrap();
             }
             drop(out_batch);
-            if output.flush().await {
-                break;
-            }
-            if done {
+            if output.flush().await || done {
                 break;
             }
         }
@@ -149,7 +149,7 @@ where
 pub fn from_fn<I, O, F, Fut>(f: F) -> impl Stage<Input = I, Output = O>
 where
     F: FnOnce(PipeReader<I>, PipeWriter<O>) -> Fut + Send + 'static,
-    Fut: Future<Output = io::Result<()>> + Send + 'static,
+    Fut: Future<Output = IoResult<()>> + Send + 'static,
     I: Send + 'static,
     O: Send + 'static,
 {
@@ -162,16 +162,19 @@ where
     impl<I, O, F, Fut> Stage for FromFn<I, O, F, Fut>
     where
         F: FnOnce(PipeReader<I>, PipeWriter<O>) -> Fut + Send + 'static,
-        Fut: Future<Output = io::Result<()>> + Send + 'static,
+        Fut: Future<Output = IoResult<()>> + Send + 'static,
         I: Send + 'static,
         O: Send + 'static,
     {
         type Input = I;
         type Output = O;
-        type Fut = Fut;
 
-        fn run(self, input: PipeReader<I>, output: PipeWriter<O>) -> Fut {
-            (self.f)(input, output)
+        async fn run(
+            self,
+            input: PipeReader<I>,
+            output: PipeWriter<O>,
+        ) -> IoResult<()> {
+            (self.f)(input, output).await
         }
     }
 
@@ -209,10 +212,10 @@ pub trait Pipeline: Send + 'static {
         mut f: F,
     ) -> ForEachBatch<
         Self,
-        impl for<'a> FnMut(ReadBatch<'a, Self::Output>) -> io::Result<()> + Send + 'static,
+        impl for<'a> FnMut(ReadBatch<'a, Self::Output>) -> IoResult<()> + Send + 'static,
     >
     where
-        F: FnMut(Self::Output) -> io::Result<()> + Send + 'static,
+        F: FnMut(Self::Output) -> IoResult<()> + Send + 'static,
         Self: Sized,
     {
         self.for_each_batch(move |batch| {
@@ -225,7 +228,7 @@ pub trait Pipeline: Send + 'static {
 
     fn for_each_batch<F, O>(self, f: F) -> ForEachBatch<Self, F>
     where
-        F: for<'a> FnMut(ReadBatch<'a, O>) -> io::Result<()> + Send + 'static,
+        F: for<'a> FnMut(ReadBatch<'a, O>) -> IoResult<()> + Send + 'static,
         Self: Sized,
     {
         ForEachBatch {
@@ -234,7 +237,7 @@ pub trait Pipeline: Send + 'static {
         }
     }
 
-    fn collect<O: FromPipeline<Self::Output>>(self) -> impl Future<Output = io::Result<O>> + Send
+    fn collect<O: FromPipeline<Self::Output>>(self) -> impl Future<Output = IoResult<O>> + Send
     where
         Self: Sized,
     {
@@ -245,14 +248,14 @@ pub trait Pipeline: Send + 'static {
 pub trait FromPipeline<T>: Sized {
     fn from_pipeline<P: Pipeline<Output = T>>(
         pipeline: P,
-    ) -> impl Future<Output = io::Result<Self>> + Send;
+    ) -> impl Future<Output = IoResult<Self>> + Send;
 }
 
 impl<T: Send + 'static> FromPipeline<T> for Vec<T> {
     fn from_pipeline<P: Pipeline<Output = T>>(
         pipeline: P,
-    ) -> impl Future<Output = io::Result<Self>> + Send {
-        async fn async_from_pipeline<P: Pipeline>(pipeline: P) -> io::Result<Vec<P::Output>> {
+    ) -> impl Future<Output = IoResult<Self>> + Send {
+        async fn async_from_pipeline<P: Pipeline>(pipeline: P) -> IoResult<Vec<P::Output>> {
             use tokio::sync::oneshot;
 
             let (tx, rx) = oneshot::channel();
@@ -291,9 +294,12 @@ impl<O: Send + 'static> Pipeline for Box<dyn Pipeline<Output = O>> {
 pub trait Stage: Send + 'static {
     type Input;
     type Output: Send + 'static;
-    type Fut: Future<Output = io::Result<()>> + Send + 'static;
 
-    fn run(self, input: PipeReader<Self::Input>, output: PipeWriter<Self::Output>) -> Self::Fut;
+    fn run(
+        self,
+        input: PipeReader<Self::Input>,
+        output: PipeWriter<Self::Output>,
+    ) -> impl Future<Output = IoResult<()>> + Send + 'static;
 }
 
 pub fn default_pipe<T: Send + 'static>() -> (PipeReader<T>, PipeWriter<T>) {
@@ -313,7 +319,7 @@ impl<T: Send + 'static> PipeReader<T> {
     pub async fn next_batch<'a>(
         &'a mut self,
         min_size: impl Into<Option<usize>>,
-    ) -> io::Result<ReadBatch<'a, T>> {
+    ) -> IoResult<ReadBatch<'a, T>> {
         let min_size = min_size.into().unwrap_or(1);
         // NOTE: I don't know how to make this safe.
         let inner: &'a mut dyn PipeReaderImpl<Item = T> = &mut *self.inner;
@@ -606,7 +612,7 @@ pub struct ForEachBatch<P, F> {
 impl<P, F> Pipeline for ForEachBatch<P, F>
 where
     P: Pipeline,
-    F: for<'a> FnMut(ReadBatch<'a, P::Output>) -> io::Result<()> + Send + 'static,
+    F: for<'a> FnMut(ReadBatch<'a, P::Output>) -> IoResult<()> + Send + 'static,
 {
     type Output = std::convert::Infallible;
 
@@ -670,10 +676,7 @@ mod test {
                                 _ = out.push(item);
                             }
                             drop(out);
-                            if output.flush().await {
-                                break;
-                            }
-                            if done {
+                            if output.flush().await || done {
                                 break;
                             }
                         }
