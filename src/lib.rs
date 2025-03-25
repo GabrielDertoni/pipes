@@ -7,7 +7,6 @@ mod utils;
 
 use std::future::Future;
 use std::marker::PhantomData;
-use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -58,7 +57,7 @@ where
     P: Pipeline<Output = std::convert::Infallible>,
 {
     let mut scheduler = Scheduler::new();
-    let ctrl = Arc::new(Ctrl::new(Config { backpressure: 0 }));
+    let ctrl = Arc::new(Ctrl::new(Config::default()));
     let output = PipeWriter::new(Box::new(EmptyPipeWriter { ctrl }));
     pipeline.schedule(output, &mut scheduler);
     scheduler.wait().await
@@ -291,14 +290,11 @@ pub trait Stage: Send + 'static {
 }
 
 const DEFAULT_BUF_SIZE: usize = 1024;
-const DEFAULT_BACKPRESSURE: usize = 1024;
 
 pub fn default_pipe<T: Send + 'static>() -> (PipeReader<T>, PipeWriter<T>) {
     ringbuf::pipe::<T>(
         DEFAULT_BUF_SIZE,
-        Config {
-            backpressure: DEFAULT_BACKPRESSURE,
-        },
+        Config::default(),
     )
 }
 

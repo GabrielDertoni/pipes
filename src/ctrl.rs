@@ -1,8 +1,20 @@
 use std::sync::{Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
+// TODO: pick better default
+const DEFAULT_BACKPRESSURE: usize = 1024;
+
+#[derive(Debug, Clone)]
 pub struct Config {
     pub backpressure: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            backpressure: DEFAULT_BACKPRESSURE,
+        }
+    }
 }
 
 pub(crate) struct Ctrl<C = Config, S = Mutex<SharedCtrl>> {
