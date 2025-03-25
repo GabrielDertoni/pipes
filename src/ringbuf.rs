@@ -10,13 +10,13 @@ use std::task::{Context, Poll, ready};
 use crossbeam_utils::CachePadded;
 use slice_dst::SliceWithHeader;
 
-use crate::ctrl::{Config, LockedCtrl};
+use crate::ctrl::LockedCtrl;
 use crate::owning_slice::OwningSlice;
 use crate::{
     PipeReader, PipeReaderImpl, PipeWriter, PipeWriterImpl, ReadBatch, ReadBatchCallback,
     WriteBatch, WriteBatchCallback,
 };
-use crate::{PushErr, ctrl::Ctrl};
+use crate::{PushErr, ctrl::Ctrl, Config};
 
 pub fn pipe<T: Send + 'static>(buf_size: usize, config: Config) -> (PipeReader<T>, PipeWriter<T>) {
     assert!(buf_size < u32::MAX as usize);

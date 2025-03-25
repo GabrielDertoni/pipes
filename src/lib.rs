@@ -1,5 +1,6 @@
 #![feature(maybe_uninit_slice)]
 
+pub mod config;
 pub mod ctrl;
 mod owning_slice;
 pub mod ringbuf;
@@ -12,7 +13,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::{fmt, io};
 
-use crate::ctrl::{Config, Ctrl};
+pub use crate::config::Config;
+
+use crate::ctrl::Ctrl;
 use crate::owning_slice::OwningSlice;
 use crate::utils::SendSafeNonNull;
 
@@ -240,11 +243,15 @@ pub trait Pipeline: Send + 'static {
 }
 
 pub trait FromPipeline<T>: Sized {
-    fn from_pipeline<P: Pipeline<Output = T>>(pipeline: P) -> impl Future<Output = io::Result<Self>> + Send;
+    fn from_pipeline<P: Pipeline<Output = T>>(
+        pipeline: P,
+    ) -> impl Future<Output = io::Result<Self>> + Send;
 }
 
 impl<T: Send + 'static> FromPipeline<T> for Vec<T> {
-    fn from_pipeline<P: Pipeline<Output = T>>(pipeline: P) -> impl Future<Output = io::Result<Self>> + Send {
+    fn from_pipeline<P: Pipeline<Output = T>>(
+        pipeline: P,
+    ) -> impl Future<Output = io::Result<Self>> + Send {
         async fn async_from_pipeline<P: Pipeline>(pipeline: P) -> io::Result<Vec<P::Output>> {
             use tokio::sync::oneshot;
 
@@ -289,13 +296,9 @@ pub trait Stage: Send + 'static {
     fn run(self, input: PipeReader<Self::Input>, output: PipeWriter<Self::Output>) -> Self::Fut;
 }
 
-const DEFAULT_BUF_SIZE: usize = 1024;
-
 pub fn default_pipe<T: Send + 'static>() -> (PipeReader<T>, PipeWriter<T>) {
-    ringbuf::pipe::<T>(
-        DEFAULT_BUF_SIZE,
-        Config::default(),
-    )
+    let config = Config::default();
+    ringbuf::pipe::<T>(config.buf_size, config)
 }
 
 pub struct PipeReader<T> {
@@ -632,10 +635,7 @@ mod test {
 
     #[tokio::test]
     async fn can_collect_from_iter() {
-        let output = from_iter([1, 2, 3])
-            .collect::<Vec<i32>>()
-            .await
-            .unwrap();
+        let output = from_iter([1, 2, 3]).collect::<Vec<i32>>().await.unwrap();
 
         assert_eq!(output, &[1, 2, 3]);
     }
