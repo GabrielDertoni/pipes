@@ -10,7 +10,7 @@ use std::task::{Context, Poll, ready};
 use crossbeam_utils::CachePadded;
 use slice_dst::SliceWithHeader;
 
-use crate::ctrl::Config;
+use crate::ctrl::{Config, LockedCtrl};
 use crate::owning_slice::OwningSlice;
 use crate::{
     PipeReader, PipeReaderImpl, PipeWriter, PipeWriterImpl, ReadBatch, ReadBatchCallback,
@@ -43,6 +43,15 @@ pub struct RingPipeWriter<T> {
     flushed: usize,
 }
 
+impl<T> RingPipeWriter<T> {
+    fn sync_with_ctrl(ctrl: &LockedCtrl, buf: &mut Writer<T>, flushed: &mut usize) {
+        let produced = ctrl.produced();
+        unsafe { buf.advance((produced - *flushed) as u32) }
+        buf.sync();
+        *flushed = produced;
+    }
+}
+
 impl<T: Send + 'static> PipeWriterImpl for RingPipeWriter<T> {
     type Item = T;
 
@@ -56,22 +65,21 @@ impl<T: Send + 'static> PipeWriterImpl for RingPipeWriter<T> {
 
     fn poll_flush(&mut self, cx: &mut Context) -> Poll<bool> {
         let mut ctrl = self.ctrl.lock();
-        unsafe { self.buf.advance((ctrl.produced() - self.flushed) as u32) }
-        self.flushed = ctrl.produced();
-        self.buf.sync();
+        Self::sync_with_ctrl(&ctrl, &mut self.buf, &mut self.flushed);
         ctrl.poll_wait_to_produce(cx)
     }
 }
 
 impl<T> Drop for RingPipeWriter<T> {
     fn drop(&mut self) {
-        self.ctrl.lock().set_producer_complete();
+        let mut ctrl = self.ctrl.lock();
+        Self::sync_with_ctrl(&ctrl, &mut self.buf, &mut self.flushed);
+        ctrl.set_producer_complete();
     }
 }
 
 impl WriteBatchCallback for Arc<Ctrl> {
     fn produce_to(&mut self, produced: usize) {
-        // println!("produce_to: {produced}");
         self.lock().produce_to(produced);
     }
 }
@@ -80,6 +88,17 @@ pub struct RingPipeReader<T> {
     ctrl: Arc<Ctrl>,
     buf: Reader<T>,
     synced: usize,
+}
+
+impl<T> RingPipeReader<T> {
+    fn sync_with_ctrl(ctrl: &LockedCtrl, buf: &mut Reader<T>, synced: &mut usize) {
+        let consumed = ctrl.consumed();
+        unsafe {
+            buf.advance((consumed - *synced) as u32);
+        }
+        buf.sync();
+        *synced = consumed;
+    }
 }
 
 impl<T: Send + 'static> PipeReaderImpl for RingPipeReader<T> {
@@ -91,19 +110,13 @@ impl<T: Send + 'static> PipeReaderImpl for RingPipeReader<T> {
         _min_size: usize,
         cx: &mut Context,
     ) -> Poll<ReadBatch<'a, T>> {
-        let consumed;
-        let examined;
-        let done;
-        {
-            let mut ctrl = self.ctrl.lock();
-            consumed = ctrl.consumed();
-            examined = ctrl.examined();
-            done = ready!(ctrl.poll_wait_to_consume(cx));
-        }
-        unsafe {
-            self.buf.advance((consumed - self.synced) as u32);
-        }
-        self.buf.sync();
+        let mut ctrl = self.ctrl.lock();
+        Self::sync_with_ctrl(&ctrl, &mut self.buf, &mut self.synced);
+        let consumed = ctrl.consumed();
+        let examined = ctrl.examined();
+        let done = ready!(ctrl.poll_wait_to_consume(cx));
+
+        drop(ctrl);
         Poll::Ready(ReadBatch::new(
             consumed,
             examined,
@@ -116,7 +129,9 @@ impl<T: Send + 'static> PipeReaderImpl for RingPipeReader<T> {
 
 impl<T> Drop for RingPipeReader<T> {
     fn drop(&mut self) {
-        self.ctrl.lock().set_consumer_complete();
+        let mut ctrl = self.ctrl.lock();
+        Self::sync_with_ctrl(&ctrl, &mut self.buf, &mut self.synced);
+        ctrl.set_consumer_complete();
     }
 }
 

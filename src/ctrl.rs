@@ -10,6 +10,8 @@ pub(crate) struct Ctrl<C = Config, S = Mutex<SharedCtrl>> {
     shared: S,
 }
 
+pub(crate) type LockedCtrl<'a> = Ctrl<&'a Config, MutexGuard<'a, SharedCtrl>>;
+
 impl Ctrl {
     pub(crate) fn new(config: Config) -> Self {
         Ctrl {
@@ -23,7 +25,7 @@ impl Ctrl {
         &self.config
     }
 
-    pub(crate) fn lock(&self) -> Ctrl<&Config, MutexGuard<'_, SharedCtrl>> {
+    pub(crate) fn lock(&self) -> LockedCtrl {
         Ctrl {
             config: &self.config,
             shared: self.shared.lock().unwrap(),
