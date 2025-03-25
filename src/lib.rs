@@ -146,8 +146,9 @@ where
 
 pub fn from_fn<I, O, F, Fut>(f: F) -> impl Stage<Input = I, Output = O>
 where
-    F: FnOnce(PipeReader<I>, PipeWriter<O>) -> Fut,
+    F: FnOnce(PipeReader<I>, PipeWriter<O>) -> Fut + Send + 'static,
     Fut: Future<Output = io::Result<()>> + Send + 'static,
+    I: Send + 'static,
     O: Send + 'static,
 {
     struct FromFn<I, O, F, Fut> {
@@ -158,8 +159,9 @@ where
 
     impl<I, O, F, Fut> Stage for FromFn<I, O, F, Fut>
     where
-        F: FnOnce(PipeReader<I>, PipeWriter<O>) -> Fut,
+        F: FnOnce(PipeReader<I>, PipeWriter<O>) -> Fut + Send + 'static,
         Fut: Future<Output = io::Result<()>> + Send + 'static,
+        I: Send + 'static,
         O: Send + 'static,
     {
         type Input = I;
@@ -177,7 +179,7 @@ where
     }
 }
 
-pub trait Pipeline {
+pub trait Pipeline: Send + 'static {
     type Output: Send + 'static;
 
     fn schedule(&mut self, output: PipeWriter<Self::Output>, scheduler: &mut Scheduler);
@@ -230,25 +232,20 @@ pub trait Pipeline {
         }
     }
 
-    fn collect<'a, O: FromPipeline<Self::Output>>(self) -> O::Fut<'a>
+    fn collect<O: FromPipeline<Self::Output>>(self) -> impl Future<Output = io::Result<O>> + Send
     where
-        Self: Sized + 'a,
+        Self: Sized,
     {
         O::from_pipeline(self)
     }
 }
 
 pub trait FromPipeline<T>: Sized {
-    // NOTE: Maybe it would be better to make `Pipeline: Send + 'static` for everything?
-    type Fut<'a>: Future<Output = io::Result<Self>> + 'a;
-
-    fn from_pipeline<'a, P: Pipeline<Output = T> + 'a>(pipeline: P) -> Self::Fut<'a>;
+    fn from_pipeline<P: Pipeline<Output = T>>(pipeline: P) -> impl Future<Output = io::Result<Self>> + Send;
 }
 
 impl<T: Send + 'static> FromPipeline<T> for Vec<T> {
-    type Fut<'a> = Pin<Box<dyn Future<Output = io::Result<Vec<T>>> + 'a>>;
-
-    fn from_pipeline<'a, P: Pipeline<Output = T> + 'a>(pipeline: P) -> Self::Fut<'a> {
+    fn from_pipeline<P: Pipeline<Output = T>>(pipeline: P) -> impl Future<Output = io::Result<Self>> + Send {
         async fn async_from_pipeline<P: Pipeline>(pipeline: P) -> io::Result<Vec<P::Output>> {
             use tokio::sync::oneshot;
 
@@ -285,7 +282,7 @@ impl<O: Send + 'static> Pipeline for Box<dyn Pipeline<Output = O>> {
     }
 }
 
-pub trait Stage {
+pub trait Stage: Send + 'static {
     type Input;
     type Output: Send + 'static;
     type Fut: Future<Output = io::Result<()>> + Send + 'static;
@@ -640,7 +637,7 @@ mod test {
     #[tokio::test]
     async fn can_collect_from_iter() {
         let output = from_iter([1, 2, 3])
-            .collect::<'_, Vec<i32>>()
+            .collect::<Vec<i32>>()
             .await
             .unwrap();
 
@@ -651,7 +648,7 @@ mod test {
     async fn mapped_stages_work() {
         let output = from_iter([1, 2, 3])
             .stack(mapped(|i| i * 2))
-            .collect::<'_, Vec<i32>>()
+            .collect::<Vec<i32>>()
             .await
             .unwrap();
 
